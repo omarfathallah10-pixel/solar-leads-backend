@@ -53,6 +53,10 @@ const schema = z.object({
     .default('https://power.larc.nasa.gov/api/temporal/climatology/point'),
   GOOGLE_MAPS_API_KEY: z.string().optional(),
   HUNTER_API_KEY: z.string().optional(),
+  // Optional: contact extraction falls back to the free website scraper alone
+  // when unset (see src/enrichment/openaiEnricher.ts).
+  OPENAI_API_KEY: z.string().optional(),
+  OPENAI_MODEL: z.string().default('gpt-4o-mini'),
 
   MONTHLY_API_BUDGET_USD: z.coerce.number().default(50),
   ENRICHMENT_USER_AGENT: z.string().default('SolarLeads/0.1'),
