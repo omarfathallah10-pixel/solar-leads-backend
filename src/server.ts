@@ -19,6 +19,23 @@ export async function buildServer() {
 
   const app = Fastify({ logger, trustProxy: true });
 
+  // Fastify's default JSON parser rejects an empty body sent with
+  // "Content-Type: application/json" (400 "Body cannot be empty..."). Several
+  // routes (e.g. POST /leads/:id/approve) take no body at all, and plenty of
+  // fetch clients send that header out of habit even with nothing to send —
+  // treat an empty body as {} instead of making every caller special-case it.
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body, done) => {
+    if (body === '') {
+      done(null, {});
+      return;
+    }
+    try {
+      done(null, JSON.parse(body as string));
+    } catch (err) {
+      done(err as Error, undefined);
+    }
+  });
+
   // Surface the real cause instead of a bare "Internal Server Error". In
   // development the message goes to the client too — chasing a 500 through a
   // terminal in another window is exactly how a whole afternoon disappears.
