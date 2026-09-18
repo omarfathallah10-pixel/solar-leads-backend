@@ -17,7 +17,7 @@ export async function buildServer() {
   // Must run before any route can serialise a BigInt id.
   installBigIntSerializer();
 
-  const app = Fastify({ loggerInstance: logger, trustProxy: true });
+  const app = Fastify({ logger, trustProxy: true });
 
   // Surface the real cause instead of a bare "Internal Server Error". In
   // development the message goes to the client too — chasing a 500 through a
