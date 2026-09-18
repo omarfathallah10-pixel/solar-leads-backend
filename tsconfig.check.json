@@ -1,0 +1,15 @@
+{
+  "// note": "Typechecks only the Prisma-independent modules. Useful in CI stages or environments where `prisma generate` cannot reach binaries.prisma.sh. The full `npm run typecheck` requires a generated client.",
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/scoring/types.ts", "src/scoring/math.ts", "src/scoring/factors.ts",
+    "src/scoring/engine.ts",
+    "src/email/render.ts", "src/email/unsubscribe.ts",
+    "src/email/providers/types.ts", "src/email/providers/graph.ts",
+    "src/email/providers/ses.ts",
+    "src/lib/errors.ts", "src/lib/http.ts", "src/lib/logger.ts",
+    "src/config/env.ts",
+    "src/outreach/personalization.ts",
+    "tests/scoring.test.ts", "tests/render.test.ts", "tests/setup.ts"
+  ]
+}

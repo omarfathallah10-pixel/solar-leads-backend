@@ -1,0 +1,726 @@
+// ============================================================================
+//  Solar B2B Lead Generation Platform — Prisma schema
+// ============================================================================
+//  IMPORTANT: three things this schema deliberately does NOT express, because
+//  Prisma cannot, and which live in prisma/migrations/*/migration.sql instead:
+//
+//   1. PARTIAL UNIQUE INDEXES  — the "one intro email ever" guarantee.
+//      Prisma has no `WHERE` clause on @@unique. This is the single most
+//      important constraint in the system, so it is applied as raw SQL.
+//
+//   2. POSTGIS GENERATED COLUMNS — `location geography(Point,4326)` derived
+//      from latitude/longitude. Prisma has no geography type, so we store
+//      plain floats here and let Postgres generate the indexed geography
+//      column. Radius queries use $queryRaw.
+//
+//   3. TRIGRAM + GIST INDEXES  — fuzzy company-name dedupe and spatial lookup.
+//
+//  Run `npm run db:migrate`, which applies the generated migration and then
+//  prisma/sql/constraints.sql. Never `prisma db push` in this project: it will
+//  drop the hand-written indexes and silently remove your duplicate protection.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+
+  // NEVER hardcode the connection string here. It contains the database
+  // password, and schema.prisma is committed to git. Keep it in .env.
+  url = env("DATABASE_URL")
+
+  // Required whenever DATABASE_URL points at a connection pooler — which it
+  // must on Supabase. Migrations and introspection cannot run through a
+  // pooler, so Prisma uses this connection for those instead.
+  // Self-hosted Postgres: set DIRECT_URL to the same value as DATABASE_URL.
+  directUrl = env("DIRECT_URL")
+
+  // The `extensions` property is deliberately NOT used. It needs the
+  // postgresqlExtensions preview feature, and on Supabase it fights with the
+  // platform, which installs extensions into a dedicated `extensions` schema
+  // rather than `public`. prisma/sql/constraints.sql creates them instead,
+  // which works on both.
+}
+
+// ============================================================================
+//  ENUMS
+// ============================================================================
+
+enum LeadStatus {
+  new
+  enriching
+  scored
+  approved
+  contacted
+  engaged
+  qualified
+  won
+  lost
+  disqualified
+  suppressed
+}
+
+enum EmailStatus {
+  unverified
+  valid
+  risky
+  catch_all
+  invalid
+  unknown
+}
+
+enum Seniority {
+  c_level
+  vp
+  director
+  manager
+  engineer
+  owner
+  other
+  unknown
+}
+
+enum MessageType {
+  intro
+  followup_1
+  followup_2
+  manual
+  breakup
+}
+
+enum MessageStatus {
+  queued
+  sending
+  sent
+  delivered
+  opened
+  clicked
+  replied
+  bounced
+  complained
+  failed
+  suppressed
+  cancelled
+}
+
+enum DataConfidence {
+  confirmed
+  high
+  medium
+  low
+  absent
+}
+
+enum LawfulBasis {
+  legitimate_interest
+  consent
+  contract
+  not_established
+}
+
+enum OwnershipType {
+  owner
+  tenant
+  mixed
+  unknown
+}
+
+enum UserRole {
+  sales
+  manager
+  admin
+}
+
+enum MailProvider {
+  msgraph
+  gmail
+  ses
+  smtp
+}
+
+// ============================================================================
+//  SECTORS — energy characteristics that feed the scoring engine directly
+// ============================================================================
+
+model Sector {
+  id        Int     @id @default(autoincrement()) @db.SmallInt
+  key       String  @unique
+  parentKey String? @map("parent_key")
+  name      String
+
+  /// 0..1 — average load / peak load. Cold storage ~0.85, warehouse ~0.45.
+  loadFactor Decimal @map("load_factor") @db.Decimal(3, 2)
+
+  /// 0..1 — share of consumption falling in solar hours. The stronger driver.
+  daytimeAlignment Decimal @map("daytime_alignment") @db.Decimal(3, 2)
+
+  /// 0..1 — roof area net of HVAC, walkways, skylights, shading.
+  usableRoofFactor Decimal @default(0.60) @map("usable_roof_factor") @db.Decimal(3, 2)
+
+  /// Capacity is normalised WITHIN sector. Without this, a 30 kWp yacht always
+  /// scores near zero against industrial leads and the marine sector becomes
+  /// invisible in the pipeline.
+  capacityBandLowKwp  Decimal @map("capacity_band_low_kwp") @db.Decimal(10, 2)
+  capacityBandHighKwp Decimal @map("capacity_band_high_kwp") @db.Decimal(10, 2)
+
+  /// Pain points used for email personalisation, e.g. ["diesel backup cost"].
+  painPoints Json    @default("[]") @map("pain_points")
+  isActive   Boolean @default(true) @map("is_active")
+
+  companies Company[]
+  leads     Lead[]
+  templates EmailTemplate[]
+  campaigns OutreachCampaign[]
+
+  @@map("sectors")
+}
+
+// ============================================================================
+//  COMPANIES
+// ============================================================================
+
+model Company {
+  id             String  @id @default(uuid()) @db.Uuid
+  name           String
+  legalName      String? @map("legal_name")
+  /// Lowercased, legal suffixes stripped. Indexed with pg_trgm for fuzzy dedupe.
+  normalizedName String  @map("normalized_name")
+  /// Canonical apex domain. citext + partial unique index (see migration.sql).
+  domain         String? @db.Citext
+  website        String?
+
+  sectorId      Int?          @map("sector_id") @db.SmallInt
+  ownershipType OwnershipType @default(unknown) @map("ownership_type")
+
+  employeeCountEst Int?    @map("employee_count_est")
+  hqAddress        String? @map("hq_address")
+  hqCity           String? @map("hq_city")
+  hqCountryCode    String? @map("hq_country_code") @db.Char(2)
+  hqLatitude       Float?  @map("hq_latitude")
+  hqLongitude      Float?  @map("hq_longitude")
+  // hq_location geography(Point,4326) is GENERATED from the two floats above.
+
+  /// Harvested free from the company website: ["iso_14001","net_zero_target"].
+  sustainabilitySignals Json @default("[]") @map("sustainability_signals")
+  /// {"osm_id":"way/2841","overture_id":"...","google_place_id":"..."}
+  externalIds           Json @default("{}") @map("external_ids")
+  metadata              Json @default("{}")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  sector   Sector?       @relation(fields: [sectorId], references: [id])
+  sites    CompanySite[]
+  contacts Contact[]
+  leads    Lead[]
+
+  @@index([sectorId])
+  @@index([hqCountryCode])
+  @@map("companies")
+}
+
+// ============================================================================
+//  COMPANY SITES — solar economics are per-site, not per-company
+// ============================================================================
+
+model CompanySite {
+  id          String  @id @default(uuid()) @db.Uuid
+  companyId   String  @map("company_id") @db.Uuid
+  label       String?
+  siteType    String? @map("site_type") // factory | warehouse | hotel | marina | land
+  address     String?
+  city        String?
+  countryCode String? @map("country_code") @db.Char(2)
+
+  latitude  Float
+  longitude Float
+  // location geography(Point,4326) GENERATED — see migration.sql
+
+  /// GeoJSON Polygon from OSM/Overture. Area computed in-app with @turf/area.
+  footprintGeojson Json? @map("footprint_geojson")
+
+  roofAreaM2         Decimal?       @map("roof_area_m2") @db.Decimal(12, 2)
+  roofAreaSource     String?        @map("roof_area_source") // osm_polygon | google_solar | manual
+  roofAreaConfidence DataConfidence @default(absent) @map("roof_area_confidence")
+  groundAreaM2       Decimal?       @map("ground_area_m2") @db.Decimal(12, 2)
+  roofTiltDeg        Decimal?       @map("roof_tilt_deg") @db.Decimal(5, 2)
+  roofAzimuthDeg     Decimal?       @map("roof_azimuth_deg") @db.Decimal(5, 2)
+
+  /// Climate normal — fetch once, cache forever. It does not change.
+  ghiKwhM2Day  Decimal?  @map("ghi_kwh_m2_day") @db.Decimal(6, 3)
+  ghiSource    String?   @map("ghi_source")
+  ghiFetchedAt DateTime? @map("ghi_fetched_at") @db.Timestamptz(6)
+
+  estimatedKwp       Decimal? @map("estimated_kwp") @db.Decimal(10, 2)
+  estimatedAnnualMwh Decimal? @map("estimated_annual_mwh") @db.Decimal(12, 2)
+
+  hasExistingSolar Boolean? @map("has_existing_solar")
+  existingSolarKwp Decimal? @map("existing_solar_kwp") @db.Decimal(10, 2)
+
+  /// 0..100 where LOWER means a worse grid, which means a BETTER lead.
+  gridReliabilityScore  Int?     @map("grid_reliability_score") @db.SmallInt
+  kmToGridInfrastructure Decimal? @map("km_to_grid_infrastructure") @db.Decimal(8, 2)
+  isRemote              Boolean  @default(false) @map("is_remote")
+  distanceFromBaseKm    Decimal? @map("distance_from_base_km") @db.Decimal(8, 2)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  leads   Lead[]
+
+  @@index([companyId])
+  @@index([estimatedKwp(sort: Desc)])
+  @@map("company_sites")
+}
+
+// ============================================================================
+//  CONTACTS
+// ============================================================================
+
+model Contact {
+  id        String  @id @default(uuid()) @db.Uuid
+  companyId String  @map("company_id") @db.Uuid
+  fullName  String? @map("full_name")
+  firstName String? @map("first_name")
+  lastName  String? @map("last_name")
+  title     String?
+
+  seniority  Seniority @default(unknown)
+  department String? // facilities | operations | procurement | esg | engineering
+
+  /// citext + partial unique index (see migration.sql).
+  email           String?      @db.Citext
+  emailStatus     EmailStatus  @default(unverified) @map("email_status")
+  emailSource     String?      @map("email_source") // website_scrape | hunter | pattern | manual
+  emailVerifiedAt DateTime?    @map("email_verified_at") @db.Timestamptz(6)
+
+  phoneE164    String? @map("phone_e164")
+  whatsappE164 String? @map("whatsapp_e164")
+  linkedinUrl  String? @map("linkedin_url")
+  languagePref String  @default("en") @map("language_pref") @db.Char(2)
+  isPrimary    Boolean @default(false) @map("is_primary")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company  Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  leads    Lead[]
+  messages OutreachMessage[]
+  consents ConsentRecord[]
+
+  @@index([companyId])
+  @@map("contacts")
+}
+
+// ============================================================================
+//  LEADS
+// ============================================================================
+
+model Lead {
+  id        String  @id @default(uuid()) @db.Uuid
+  companyId String  @map("company_id") @db.Uuid
+  contactId String? @map("contact_id") @db.Uuid
+  siteId    String? @map("site_id") @db.Uuid
+  sectorId  Int?    @map("sector_id") @db.SmallInt
+
+  status      LeadStatus @default(new)
+  ownerUserId String?    @map("owner_user_id") @db.Uuid
+  source      String // osm | overture | tender_watch | manual_import
+  sourceRef   String?    @map("source_ref")
+
+  /// Denormalised for fast grid filtering. Authoritative history in LeadScore.
+  currentScore     Decimal?  @map("current_score") @db.Decimal(5, 2)
+  currentScoreBand String?   @map("current_score_band")
+  currentScoreId   String?   @map("current_score_id") @db.Uuid
+  scoreCoverage    Decimal?  @map("score_coverage") @db.Decimal(4, 3)
+  lastScoredAt     DateTime? @map("last_scored_at") @db.Timestamptz(6)
+
+  approvedAt         DateTime? @map("approved_at") @db.Timestamptz(6)
+  approvedBy         String?   @map("approved_by") @db.Uuid
+  disqualifiedReason String?   @map("disqualified_reason")
+  notes              String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company  Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contact  Contact?          @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  site     CompanySite?      @relation(fields: [siteId], references: [id], onDelete: SetNull)
+  sector   Sector?           @relation(fields: [sectorId], references: [id])
+  owner    User?             @relation("LeadOwner", fields: [ownerUserId], references: [id])
+  scores   LeadScore[]
+  messages OutreachMessage[]
+
+  // A lead IS a (company, contact) pair. Partial unique (contact_id NOT NULL)
+  // is applied in migration.sql — Prisma's @@unique would treat multiple NULL
+  // contact_ids as distinct anyway, but the partial index documents the intent
+  // and keeps the index small.
+  @@index([currentScore(sort: Desc)])
+  @@index([status])
+  @@index([status, sectorId, currentScore(sort: Desc)], map: "idx_leads_triage")
+  @@index([ownerUserId])
+  @@map("leads")
+}
+
+// ============================================================================
+//  SCORING — versioned so old scores stay reproducible
+// ============================================================================
+
+model ScoringModel {
+  id        String   @id @default(uuid()) @db.Uuid
+  version   String   @unique
+  name      String
+  isActive  Boolean  @default(false) @map("is_active")
+  config    Json
+  /// WHY the weights changed. Treated as mandatory in code review.
+  notes     String?
+  createdBy String?  @map("created_by") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  factors ScoringFactor[]
+  scores  LeadScore[]
+
+  // Exactly one active model, enforced by a partial unique index in SQL.
+  @@map("scoring_models")
+}
+
+model ScoringFactor {
+  id       String  @id @default(uuid()) @db.Uuid
+  modelId  String  @map("model_id") @db.Uuid
+  key      String
+  label    String
+  weight   Decimal @db.Decimal(5, 2)
+  config   Json    @default("{}")
+  isActive Boolean @default(true) @map("is_active")
+
+  model ScoringModel @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, key])
+  @@map("scoring_factors")
+}
+
+model LeadScore {
+  id       String  @id @default(uuid()) @db.Uuid
+  leadId   String  @map("lead_id") @db.Uuid
+  modelId  String  @map("model_id") @db.Uuid
+  score    Decimal @db.Decimal(5, 2)
+  band     String
+  coverage Decimal @db.Decimal(4, 3)
+
+  /// Full factor-by-factor breakdown including human-readable evidence strings.
+  /// Snapshotted so a score stays explainable exactly as computed, even after
+  /// the underlying site or contact data changes.
+  breakdown Json
+
+  /// Hash of scoring inputs. Lets a batch re-score skip unchanged leads.
+  inputsHash String   @map("inputs_hash")
+  computedAt DateTime @default(now()) @map("computed_at") @db.Timestamptz(6)
+
+  lead  Lead         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  model ScoringModel @relation(fields: [modelId], references: [id])
+
+  @@index([leadId, computedAt(sort: Desc)])
+  @@map("lead_scores")
+}
+
+// ============================================================================
+//  OUTREACH
+// ============================================================================
+
+model SendingIdentity {
+  id             String       @id @default(uuid()) @db.Uuid
+  mailboxEmail   String       @unique @map("mailbox_email") @db.Citext
+  displayName    String       @map("display_name")
+  provider       MailProvider
+  providerConfig Json         @default("{}") @map("provider_config")
+
+  /// Self-imposed, well below provider limits. Reputation protection.
+  dailyCap    Int     @default(50) @map("daily_cap") @db.SmallInt
+  warmupStage Int     @default(0) @map("warmup_stage") @db.SmallInt
+  userId      String? @map("user_id") @db.Uuid
+  isActive    Boolean @default(true) @map("is_active")
+
+  user     User?             @relation(fields: [userId], references: [id])
+  messages OutreachMessage[]
+
+  @@map("sending_identities")
+}
+
+model EmailTemplate {
+  id              String  @id @default(uuid()) @db.Uuid
+  key             String
+  version         Int     @default(1)
+  sectorId        Int?    @map("sector_id") @db.SmallInt
+  language        String  @default("en") @db.Char(2)
+  subjectTemplate String  @map("subject_template")
+  bodyTemplate    String  @map("body_template")
+  requiredVars    String[] @default([]) @map("required_vars")
+  isActive        Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  sector    Sector?            @relation(fields: [sectorId], references: [id])
+  messages  OutreachMessage[]
+  campaigns OutreachCampaign[]
+
+  @@unique([key, version])
+  @@map("email_templates")
+}
+
+model OutreachCampaign {
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String
+  templateId String   @map("template_id") @db.Uuid
+  sectorId   Int?     @map("sector_id") @db.SmallInt
+  minScore   Decimal  @default(65) @map("min_score") @db.Decimal(5, 2)
+  dailyCap   Int      @default(100) @map("daily_cap") @db.SmallInt
+  status     String   @default("draft")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  template EmailTemplate     @relation(fields: [templateId], references: [id])
+  sector   Sector?           @relation(fields: [sectorId], references: [id])
+  messages OutreachMessage[]
+
+  @@map("outreach_campaigns")
+}
+
+model OutreachMessage {
+  id                String  @id @default(uuid()) @db.Uuid
+  leadId            String  @map("lead_id") @db.Uuid
+  contactId         String  @map("contact_id") @db.Uuid
+  campaignId        String? @map("campaign_id") @db.Uuid
+  templateId        String  @map("template_id") @db.Uuid
+  templateVersion   Int     @map("template_version")
+  sendingIdentityId String  @map("sending_identity_id") @db.Uuid
+
+  messageType MessageType   @map("message_type")
+  status      MessageStatus @default(queued)
+
+  /// Deterministic: "intro:<leadId>". Doubles as the BullMQ jobId, so an
+  /// accidental double-enqueue is collapsed by the queue before it ever
+  /// reaches the database.
+  idempotencyKey String @unique @map("idempotency_key")
+
+  toEmail         String @map("to_email") @db.Citext
+  subjectRendered String @default("") @map("subject_rendered")
+  /// Exactly what was sent. Needed for disputes and for Art. 15 access requests.
+  bodyRendered    String @default("") @map("body_rendered")
+
+  providerMessageId   String? @map("provider_message_id")
+  /// RFC5322 Message-ID. Primary key for matching inbound replies.
+  rfc822MessageId     String? @map("rfc822_message_id")
+  /// Graph conversationId — the cheapest reliable reply-matching handle.
+  graphConversationId String? @map("graph_conversation_id")
+
+  attemptCount Int       @default(0) @map("attempt_count") @db.SmallInt
+  lastError    String?   @map("last_error")
+  scheduledFor DateTime? @map("scheduled_for") @db.Timestamptz(6)
+  sentAt       DateTime? @map("sent_at") @db.Timestamptz(6)
+  firstOpenedAt DateTime? @map("first_opened_at") @db.Timestamptz(6)
+  repliedAt    DateTime? @map("replied_at") @db.Timestamptz(6)
+  bouncedAt    DateTime? @map("bounced_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  lead            Lead              @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  contact         Contact           @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  campaign        OutreachCampaign? @relation(fields: [campaignId], references: [id])
+  template        EmailTemplate     @relation(fields: [templateId], references: [id])
+  sendingIdentity SendingIdentity   @relation(fields: [sendingIdentityId], references: [id])
+  events          EmailEvent[]
+  suppressions    SuppressionEntry[]
+
+  // ⚠ The duplicate-prevention guarantee lives in migration.sql as TWO partial
+  //   unique indexes (per contact, per lead, WHERE type='intro' AND
+  //   status <> 'failed'). It CANNOT be expressed here.
+  @@index([status, scheduledFor])
+  @@index([leadId, createdAt(sort: Desc)])
+  @@index([graphConversationId])
+  @@map("outreach_messages")
+}
+
+model EmailEvent {
+  id        BigInt @id @default(autoincrement())
+  messageId String @map("message_id") @db.Uuid
+  eventType String @map("event_type") // delivered|open|click|bounce|complaint|reply
+
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(6)
+
+  /// Providers retry webhooks aggressively. UNIQUE here turns a duplicate
+  /// delivery into a no-op instead of double-counting or re-suppressing.
+  providerEventId String? @unique @map("provider_event_id")
+
+  bounceType String? @map("bounce_type") // permanent | transient
+  payload    Json    @default("{}")
+  userAgent  String? @map("user_agent")
+  /// Hashed, never raw — an IP address is personal data.
+  ipHash     String? @map("ip_hash")
+
+  receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+
+  message OutreachMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId, occurredAt])
+  @@index([eventType, occurredAt(sort: Desc)])
+  @@map("email_events")
+}
+
+// ============================================================================
+//  COMPLIANCE
+// ============================================================================
+
+model ConsentRecord {
+  id           String      @id @default(uuid()) @db.Uuid
+  subjectEmail String      @map("subject_email") @db.Citext
+  contactId    String?     @map("contact_id") @db.Uuid
+  basis        LawfulBasis @default(not_established)
+  /// Basis validity is country-specific: several EU states treat B2B email
+  /// closer to B2C. The send path gates on this.
+  jurisdiction String?     @db.Char(2)
+  /// Reference to the Legitimate Interests Assessment document.
+  liaReference String?     @map("lia_reference")
+  evidence     Json        @default("{}")
+
+  establishedAt DateTime  @default(now()) @map("established_at") @db.Timestamptz(6)
+  expiresAt     DateTime? @map("expires_at") @db.Timestamptz(6)
+  withdrawnAt   DateTime? @map("withdrawn_at") @db.Timestamptz(6)
+
+  contact Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@index([subjectEmail])
+  @@map("consent_records")
+}
+
+model SuppressionEntry {
+  id     String  @id @default(uuid()) @db.Uuid
+  email  String? @db.Citext
+  /// Block an entire company on request.
+  domain String? @db.Citext
+  reason String // unsubscribe | complaint | hard_bounce | manual | legal_request
+
+  sourceMessageId String?  @map("source_message_id") @db.Uuid
+  notes           String?
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  sourceMessage OutreachMessage? @relation(fields: [sourceMessageId], references: [id], onDelete: SetNull)
+
+  // Partial unique indexes on email and domain live in migration.sql.
+  @@map("suppression_list")
+}
+
+model RawSourceRecord {
+  id          BigInt   @id @default(autoincrement())
+  entityType  String   @map("entity_type") // company | site | contact
+  entityId    String   @map("entity_id") @db.Uuid
+  sourceKey   String   @map("source_key") // osm | overture | hunter | google_solar | website
+  sourceUrl   String?  @map("source_url")
+  license     String?
+  collectedAt DateTime @default(now()) @map("collected_at") @db.Timestamptz(6)
+  /// Verbatim provider response. Never call a paid API twice for the same thing.
+  raw         Json
+
+  @@index([entityType, entityId])
+  @@index([sourceKey, collectedAt(sort: Desc)])
+  @@map("raw_source_records")
+}
+
+model DataSubjectRequest {
+  id              String   @id @default(uuid()) @db.Uuid
+  requestType     String   @map("request_type") // access|erasure|objection|rectification
+  subjectEmail    String   @map("subject_email") @db.Citext
+  receivedAt      DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+  dueAt           DateTime @map("due_at") @db.Timestamptz(6)
+  status          String   @default("open")
+  handledBy       String?  @map("handled_by") @db.Uuid
+  resolutionNotes String?  @map("resolution_notes")
+
+  @@map("data_subject_requests")
+}
+
+// ============================================================================
+//  USERS, AUDIT, INTEGRATIONS, COST CONTROL
+// ============================================================================
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique @db.Citext
+  fullName     String   @map("full_name")
+  role         UserRole @default(sales)
+  passwordHash String?  @map("password_hash")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  ownedLeads        Lead[]            @relation("LeadOwner")
+  sendingIdentities SendingIdentity[]
+  auditEntries      AuditLog[]
+
+  @@map("users")
+}
+
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String // lead.approved | lead.exported | model.activated
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id") @db.Uuid
+  diff       Json?
+  ipHash     String?  @map("ip_hash")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([createdAt(sort: Desc)])
+  @@map("audit_log")
+}
+
+model WebhookEndpoint {
+  id       String   @id @default(uuid()) @db.Uuid
+  name     String
+  url      String
+  /// HMAC-SHA256 signing key.
+  secret   String
+  events   String[] // ['lead.scored','lead.replied']
+  isActive Boolean  @default(true) @map("is_active")
+
+  deliveries WebhookDelivery[]
+
+  @@map("webhook_endpoints")
+}
+
+model WebhookDelivery {
+  id           BigInt    @id @default(autoincrement())
+  endpointId   String    @map("endpoint_id") @db.Uuid
+  eventType    String    @map("event_type")
+  payload      Json
+  statusCode   Int?      @map("status_code")
+  attemptCount Int       @default(0) @map("attempt_count") @db.SmallInt
+  deliveredAt  DateTime? @map("delivered_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@index([endpointId, createdAt(sort: Desc)])
+  @@map("webhook_deliveries")
+}
+
+/// Budget guardrail. Every external API call writes a row here. A scheduled job
+/// sums month-to-date spend and pauses the enrichment queues at the ceiling.
+/// Without this, one buggy loop over 10,000 leads against a $32/1,000 SKU is a
+/// $320 mistake made in four minutes.
+model ApiUsage {
+  id         BigInt   @id @default(autoincrement())
+  provider   String // google_solar | google_places | hunter | apollo | overpass
+  sku        String
+  units      Int      @default(1)
+  estCostUsd Decimal  @default(0) @map("est_cost_usd") @db.Decimal(10, 5)
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id") @db.Uuid
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  @@index([provider, occurredAt(sort: Desc)])
+  @@index([occurredAt(sort: Desc)])
+  @@map("api_usage_ledger")
+}
