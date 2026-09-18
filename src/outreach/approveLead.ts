@@ -36,7 +36,7 @@ export async function approveLeadForOutreach(params: {
   let createdMessageId: string | null = null;
 
   try {
-    const outcome = await prisma.$transaction(async (tx) => {
+    const outcome = await prisma.$transaction(async (tx): Promise<ApprovalResult> => {
       // Serialise concurrent approvals of the same lead. Two tabs clicking
       // Approve simultaneously now queue behind each other rather than both
       // sailing through the checks.
