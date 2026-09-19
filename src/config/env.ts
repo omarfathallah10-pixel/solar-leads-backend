@@ -54,9 +54,10 @@ const schema = z.object({
   GOOGLE_MAPS_API_KEY: z.string().optional(),
   HUNTER_API_KEY: z.string().optional(),
   // Optional: contact extraction falls back to the free website scraper alone
-  // when unset (see src/enrichment/openaiEnricher.ts).
-  OPENAI_API_KEY: z.string().optional(),
-  OPENAI_MODEL: z.string().default('gpt-4o-mini'),
+  // when unset (see src/enrichment/geminiEnricher.ts). Gemini's free tier
+  // has no dollar cost, so this is not covered by MONTHLY_API_BUDGET_USD.
+  GEMINI_API_KEY: z.string().optional(),
+  GEMINI_MODEL: z.string().default('gemini-1.5-flash'),
 
   MONTHLY_API_BUDGET_USD: z.coerce.number().default(50),
   ENRICHMENT_USER_AGENT: z.string().default('SolarLeads/0.1'),

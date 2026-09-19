@@ -1,7 +1,7 @@
 import { Job, UnrecoverableError } from 'bullmq';
 import { attachContactToLeads, ensureLeadForSite } from '../../enrichment/createLead';
 import { enrichCompanyFromWeb, enrichSite } from '../../enrichment/enrichSite';
-import { enrichCompanyContactWithOpenAI } from '../../enrichment/openaiEnricher';
+import { enrichCompanyContactWithGemini } from '../../enrichment/geminiEnricher';
 import { BudgetExceededError } from '../../lib/errors';
 import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
@@ -13,10 +13,11 @@ export async function processEnrichment(job: Job<EnrichmentJob>): Promise<unknow
   try {
     if (siteId) await enrichSite(siteId);
     if (companyId) await enrichCompanyFromWeb(companyId);
-    // Paid LLM fallback: only reached when the free scrape above found no
+    // Free LLM fallback: only reached when the free scrape above found no
     // contact at all. Runs before attachContactToLeads below so a contact it
-    // creates gets linked to a waiting lead in the same pass.
-    if (companyId) await enrichCompanyContactWithOpenAI(companyId);
+    // creates gets linked to a waiting lead in the same pass. Not gated on
+    // the budget breaker below — Gemini's free tier has no dollar cost.
+    if (companyId) await enrichCompanyContactWithGemini(companyId);
   } catch (err) {
     // The budget breaker tripping is not a job failure to retry — it is a
     // deliberate stop. Retrying would just burn the queue against a closed gate.
