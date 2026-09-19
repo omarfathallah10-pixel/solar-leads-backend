@@ -23,7 +23,8 @@
     "db:constraints": "tsx scripts/applyConstraints.ts",
     "db:setup": "npm run preflight && prisma generate && prisma migrate dev --name init && npm run db:constraints && npm run db:seed",
     "doctor": "tsx scripts/doctor.ts",
-    "preflight": "tsx scripts/preflight.ts"
+    "preflight": "tsx scripts/preflight.ts",
+    "enrich:retry": "tsx scripts/retryEnrichment.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
