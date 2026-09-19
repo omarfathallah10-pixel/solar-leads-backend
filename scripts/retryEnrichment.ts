@@ -15,14 +15,14 @@ import { disconnectPrisma, prisma } from '../src/lib/prisma';
  *
  * Runs the lookup directly and synchronously (not via the BullMQ queue) so
  * progress prints to this terminal as it happens, company by company.
+ *
+ * No delay loop here: geminiEnricher.ts itself now spaces every actual
+ * Gemini call at least 4.5s apart (shared RateLimiter, ~13.3 req/min,
+ * under the free tier's 15/min cap) and retries a 429 with a 30s cooldown
+ * before giving up on that company. A flat per-iteration sleep here would
+ * only add unnecessary wait time for companies this loop skips without
+ * ever calling Gemini (e.g. one a concurrent run already enriched).
  */
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// Keeps calls well under Gemini's free-tier requests-per-minute limit. A
-// "quick utility script" run over a few hundred companies is exactly the
-// kind of loop that trips a free tier if it fires as fast as Node can go.
-const DELAY_MS = 4_000;
 
 async function main() {
   if (!env.GEMINI_API_KEY) {
@@ -96,8 +96,6 @@ async function main() {
       stillEmpty++;
       console.log('no match — Gemini did not recognise this company');
     }
-
-    if (i < candidates.length - 1) await sleep(DELAY_MS);
   }
 
   console.log(`\nDone. ${found} enriched, ${stillEmpty} still without a contact, out of ${candidates.length}.\n`);

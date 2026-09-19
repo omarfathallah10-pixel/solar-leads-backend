@@ -2,6 +2,7 @@ import { GoogleGenerativeAI, SchemaType, type ResponseSchema } from '@google/gen
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { env } from '../config/env';
+import { RateLimiter } from '../lib/http';
 import { logger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { cacheRaw, getCachedRaw, recordUsage } from './usageLedger';
@@ -226,6 +227,47 @@ async function resolveModel(): Promise<string | null> {
   }
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Gemini's free tier caps requests at 15/minute. 4.5s between calls allows
+ * ~13.3/min — enough margin to absorb clock drift and still stay under the
+ * cap. Shared across every caller (the retry script AND the enrichment
+ * worker, which can process several companies back-to-back or concurrently)
+ * because the limit is per API key, not per process.
+ */
+const geminiLimiter = new RateLimiter(4_500);
+
+const RATE_LIMIT_RETRY_MS = 30_000;
+const MAX_RATE_LIMIT_RETRIES = 3;
+
+/**
+ * Runs one Gemini call through the shared rate limiter, retrying a 429 after
+ * a fixed cooldown. Bounded rather than infinite: a free tier also has a
+ * daily cap, and retrying an exhausted daily quota forever would burn hours
+ * against a wall that will not move until tomorrow. The retry loop runs
+ * INSIDE the scheduled function so the limiter's queue stays occupied for
+ * the whole cooldown — a concurrent caller waits behind it rather than
+ * firing its own request into the same 429.
+ */
+async function callGeminiRateLimited<T>(fn: () => Promise<T>): Promise<T> {
+  return geminiLimiter.schedule(async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        const status = (err as { status?: number })?.status;
+        if (status !== 429 || attempt >= MAX_RATE_LIMIT_RETRIES) throw err;
+        logger.warn(
+          { attempt: attempt + 1, of: MAX_RATE_LIMIT_RETRIES, waitMs: RATE_LIMIT_RETRY_MS },
+          'Gemini rate limit (429) hit — waiting before retry',
+        );
+        await sleep(RATE_LIMIT_RETRY_MS);
+      }
+    }
+  });
+}
+
 /**
  * Asks Gemini, from its own knowledge, to identify a named company's
  * website, email, phone and a contact person. Pure with respect to the
@@ -263,12 +305,14 @@ export async function lookupContactWithGemini(
       { timeout: 30_000 },
     );
 
-    const result = await model.generateContent(
-      `Company name: "${companyName}"\n` +
-        `Location: ${location ?? 'unknown'}\n\n` +
-        'Identify this specific company\'s official website, a direct contact ' +
-        'email, a phone number, and a key contact person, only if you ' +
-        'specifically recognise this company from your training knowledge.',
+    const result = await callGeminiRateLimited(() =>
+      model.generateContent(
+        `Company name: "${companyName}"\n` +
+          `Location: ${location ?? 'unknown'}\n\n` +
+          'Identify this specific company\'s official website, a direct contact ' +
+          'email, a phone number, and a key contact person, only if you ' +
+          'specifically recognise this company from your training knowledge.',
+      ),
     );
     content = result.response.text();
   } catch (err) {
@@ -285,6 +329,19 @@ export async function lookupContactWithGemini(
           (env.GEMINI_MODEL
             ? 'GEMINI_MODEL is pinned in .env — update it to a currently supported model.'
             : 'Will attempt to auto-resolve a different model on the next call.'),
+      );
+    } else if (status === 429) {
+      // callGeminiRateLimited() already retried this MAX_RATE_LIMIT_RETRIES
+      // times with a 30s cooldown between attempts — reaching this branch
+      // means the quota is still exhausted, most likely the free tier's
+      // daily cap rather than the per-minute one. Give up on this company;
+      // retrying further here would not do anything the helper hasn't
+      // already tried.
+      logger.warn(
+        { companyName },
+        `Gemini rate limit (429) persisted after ${MAX_RATE_LIMIT_RETRIES} retries — ` +
+          'giving up on this company. If this keeps happening across many ' +
+          'companies in a row, the free tier\'s daily quota is likely exhausted.',
       );
     } else {
       logger.warn({ err, companyName }, 'Gemini contact lookup request failed');
