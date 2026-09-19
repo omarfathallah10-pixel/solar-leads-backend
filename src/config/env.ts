@@ -57,7 +57,12 @@ const schema = z.object({
   // when unset (see src/enrichment/geminiEnricher.ts). Gemini's free tier
   // has no dollar cost, so this is not covered by MONTHLY_API_BUDGET_USD.
   GEMINI_API_KEY: z.string().optional(),
-  GEMINI_MODEL: z.string().default('gemini-1.5-flash'),
+  // Left unset, geminiEnricher.ts auto-detects a currently-available flash
+  // model via the API's own ListModels endpoint, rather than trusting a
+  // hardcoded name — Google has retired Gemini model versions (1.5, then
+  // 2.0) faster than this codebase could keep up by hand. Set this only to
+  // pin a specific model.
+  GEMINI_MODEL: z.string().optional(),
 
   MONTHLY_API_BUDGET_USD: z.coerce.number().default(50),
   ENRICHMENT_USER_AGENT: z.string().default('SolarLeads/0.1'),

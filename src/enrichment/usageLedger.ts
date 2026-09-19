@@ -20,11 +20,12 @@ export const UNIT_COSTS: Record<string, number> = {
   'nasa_power:climatology': 0.0,          // free, no key
   'website:fetch': 0.0,
   // Gemini free tier: $0 per call, capped by requests-per-minute/day rather
-  // than a dollar budget. Recorded here purely for call-volume visibility —
+  // than a dollar budget. No entry needed here for a specific model name —
+  // geminiEnricher.ts auto-detects whichever flash model is currently live,
+  // and recordUsage() below already defaults an unlisted 'gemini:<model>'
+  // SKU to $0. Recorded purely for call-volume visibility —
   // enrichCompanyContactWithGemini() does not call assertWithinBudget() at
   // all, so this never trips (or is gated by) the circuit breaker below.
-  'gemini:gemini-1.5-flash': 0.0,
-  'gemini:gemini-1.5-pro': 0.0,
 };
 
 interface RecordUsageArgs {

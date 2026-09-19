@@ -172,6 +172,61 @@ function getClient(): GoogleGenerativeAI | null {
 }
 
 /**
+ * Which Gemini model actually exists changes on a timescale of months, not
+ * years — 1.5 and then 2.0 were both retired outright, turning a hardcoded
+ * model name into a landmine. Resolved once per process and cached in
+ * memory: if GEMINI_MODEL is set, that pin always wins; otherwise this asks
+ * the API itself, via ListModels, which flash-class model is currently live
+ * for this key, rather than guessing.
+ */
+let cachedAutoModel: string | null = null;
+
+interface ListModelsResponse {
+  models?: Array<{ name: string; supportedGenerationMethods?: string[] }>;
+}
+
+async function resolveModel(): Promise<string | null> {
+  if (env.GEMINI_MODEL) return env.GEMINI_MODEL;
+  if (cachedAutoModel) return cachedAutoModel;
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${env.GEMINI_API_KEY}`,
+      { signal: AbortSignal.timeout(10_000) },
+    );
+    if (!res.ok) throw new Error(`ListModels HTTP ${res.status}`);
+    const data = (await res.json()) as ListModelsResponse;
+
+    const flashModels = (data.models ?? [])
+      .filter((m) => m.supportedGenerationMethods?.includes('generateContent'))
+      .map((m) => m.name.replace(/^models\//, ''))
+      // Only the general-purpose flash line: excludes *-vision/-embedding/
+      // -tts/-image variants, and anything still in "preview"/"exp", which
+      // Google can pull without notice.
+      .filter((name) => /flash/i.test(name) && !/vision|embedding|tts|image|preview|exp/i.test(name))
+      .sort();
+
+    // A plain "flash" model over "flash-lite": lite trades away quality for
+    // latency we do not need for one JSON object per company. Names sort
+    // newest-last (gemini-2.0-flash < gemini-2.5-flash < ...), so the last
+    // non-lite match is the newest stable flash model.
+    const picked = [...flashModels].reverse().find((n) => !/lite/i.test(n)) ?? flashModels.at(-1);
+    if (!picked) throw new Error('ListModels returned no flash-capable model');
+
+    cachedAutoModel = picked;
+    logger.info({ model: picked }, 'Gemini: auto-resolved a currently available model');
+    return picked;
+  } catch (err) {
+    logger.warn(
+      { err },
+      'Gemini: could not auto-resolve a model via ListModels. Set GEMINI_MODEL ' +
+        'to a specific model name to bypass auto-detection.',
+    );
+    return null;
+  }
+}
+
+/**
  * Asks Gemini, from its own knowledge, to identify a named company's
  * website, email, phone and a contact person. Pure with respect to the
  * database: callers decide what to do with the result.
@@ -190,11 +245,14 @@ export async function lookupContactWithGemini(
     return null;
   }
 
+  const modelName = await resolveModel();
+  if (!modelName) return null; // resolveModel() already logged why
+
   let content: string | null;
   try {
     const model = genAI.getGenerativeModel(
       {
-        model: env.GEMINI_MODEL,
+        model: modelName,
         systemInstruction: SYSTEM_PROMPT,
         generationConfig: {
           temperature: 0,
@@ -214,12 +272,34 @@ export async function lookupContactWithGemini(
     );
     content = result.response.text();
   } catch (err) {
-    logger.warn({ err, companyName }, 'Gemini contact lookup request failed');
+    const status = (err as { status?: number })?.status;
+    if (status === 404) {
+      // The model itself is gone (Google retires versions outright, not just
+      // deprecates them), not a transient failure. If we picked this name
+      // ourselves, drop it from the cache so the NEXT call re-resolves
+      // instead of retrying the same dead model for the rest of the process.
+      if (!env.GEMINI_MODEL) cachedAutoModel = null;
+      logger.warn(
+        { modelName, companyName },
+        `Gemini model "${modelName}" no longer exists (404). ` +
+          (env.GEMINI_MODEL
+            ? 'GEMINI_MODEL is pinned in .env — update it to a currently supported model.'
+            : 'Will attempt to auto-resolve a different model on the next call.'),
+      );
+    } else {
+      logger.warn({ err, companyName }, 'Gemini contact lookup request failed');
+    }
     return null;
   } finally {
     // Recorded for visibility into call volume even though the free tier
-    // costs nothing — see UNIT_COSTS in usageLedger.ts.
-    await recordUsage({ provider: 'gemini', sku: env.GEMINI_MODEL });
+    // costs nothing — see UNIT_COSTS in usageLedger.ts. Failure here (e.g.
+    // the DB is briefly unreachable) must not override whatever the try/
+    // catch above already decided to return — a `finally` that throws
+    // replaces the function's outcome, which would turn a ledger write
+    // hiccup into a hard crash of an otherwise-successful lookup.
+    await recordUsage({ provider: 'gemini', sku: modelName }).catch((err) => {
+      logger.warn({ err }, 'Gemini usage ledger write failed');
+    });
   }
 
   if (!content) return null;
