@@ -19,6 +19,11 @@ export const UNIT_COSTS: Record<string, number> = {
   'overpass:query': 0.0,                  // free, but rate-limited by courtesy
   'nasa_power:climatology': 0.0,          // free, no key
   'website:fetch': 0.0,
+  // gpt-4o-mini: ~$0.15/1M input + $0.60/1M output tokens. A ~1,500-token page
+  // excerpt plus a short JSON reply lands well under $0.001/call in practice;
+  // rounded up here so the budget breaker errs conservative.
+  'openai:gpt-4o-mini': 0.001,
+  'openai:gpt-3.5-turbo': 0.002,
 };
 
 interface RecordUsageArgs {
