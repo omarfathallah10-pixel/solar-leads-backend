@@ -13,8 +13,10 @@ export async function processEnrichment(job: Job<EnrichmentJob>): Promise<unknow
   try {
     if (siteId) await enrichSite(siteId);
     if (companyId) await enrichCompanyFromWeb(companyId);
-    // Free LLM fallback: only reached when the free scrape above found no
-    // contact at all. Runs before attachContactToLeads below so a contact it
+    // Free LLM-knowledge fallback: does not need a website (most Overpass
+    // leads have none) — it asks Gemini directly whether it recognises the
+    // company. Only reached when the free scrape above found no usable
+    // contact. Runs before attachContactToLeads below so a contact it
     // creates gets linked to a waiting lead in the same pass. Not gated on
     // the budget breaker below — Gemini's free tier has no dollar cost.
     if (companyId) await enrichCompanyContactWithGemini(companyId);
